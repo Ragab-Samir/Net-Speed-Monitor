@@ -1,13 +1,15 @@
 name: Build Windows EXE and Installer
 
 on:
-  workflow_dispatch:      # تشغيل يدوي من تبويب Actions
+  workflow_dispatch:
   push:
     branches: [ main, master ]
 
 jobs:
   build:
     runs-on: windows-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -43,3 +45,12 @@ jobs:
         with:
           name: NetSpeedMonitor_Portable
           path: dist/NetSpeedMonitor.exe
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0-${{ github.run_number }}
+          name: Net Speed Monitor v1.0-${{ github.run_number }}
+          files: |
+            installer_output/NetSpeedMonitor_Setup.exe
+            dist/NetSpeedMonitor.exe
