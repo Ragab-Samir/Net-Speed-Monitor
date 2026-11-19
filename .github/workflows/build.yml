@@ -1,0 +1,45 @@
+name: Build Windows EXE and Installer
+
+on:
+  workflow_dispatch:      # تشغيل يدوي من تبويب Actions
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install requirements
+        run: python -m pip install psutil pystray pillow pyinstaller
+
+      - name: Create icon
+        run: python net_speed_monitor.py --make-icon
+
+      - name: Build EXE
+        run: python -m PyInstaller --onefile --noconsole --clean --name NetSpeedMonitor --icon app.ico net_speed_monitor.py
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build installer
+        run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss'
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: NetSpeedMonitor_Setup
+          path: installer_output/NetSpeedMonitor_Setup.exe
+
+      - name: Upload portable EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: NetSpeedMonitor_Portable
+          path: dist/NetSpeedMonitor.exe
