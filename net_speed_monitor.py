@@ -332,9 +332,14 @@ class App:
     # ---- tray (callbacks تعمل في Thread آخر، فنمرر الأوامر عبر queue)
     def setup_tray(self):
         def size_item(name):
-            return pystray.MenuItem(
-                name, lambda i, it, n=name: self.cmds.put("size:" + n),
-                checked=lambda it, n=name: self.size_name() == n, radio=True)
+            # pystray يرفض الدوال التي لها قيم افتراضية، فنستخدم closure عادي
+            def action(icon, item):
+                self.cmds.put("size:" + name)
+
+            def checked(item):
+                return self.size_name() == name
+
+            return pystray.MenuItem(name, action, checked=checked, radio=True)
 
         menu = pystray.Menu(
             pystray.MenuItem("Show / Hide", lambda i, it: self.cmds.put("toggle"), default=True),
