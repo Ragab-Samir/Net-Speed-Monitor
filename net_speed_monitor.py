@@ -70,6 +70,24 @@ def fmt_bytes(n):
     return f"{n:,.2f} GB"
 
 
+def fmt_speed(kb):
+    """أقل من 1024 KB/s يظهر بالكيلوبايت، وأكبر يظهر بالميجابايت."""
+    if kb >= 1024:
+        return f"{kb / 1024:,.2f} MB/s"
+    return f"{kb:,.1f} KB/s"
+
+
+def virtual_screen(root):
+    """حدود سطح المكتب كله (تشمل الشاشات المتعددة)."""
+    try:
+        import ctypes
+        u = ctypes.windll.user32
+        return u.GetSystemMetrics(76), u.GetSystemMetrics(77), \
+            u.GetSystemMetrics(78), u.GetSystemMetrics(79)
+    except Exception:
+        return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
+
+
 def startup_command():
     if getattr(sys, "frozen", False):
         return f'"{sys.executable}" --minimized'
@@ -131,6 +149,7 @@ class UsageStore:
     def __init__(self):
         self.days = {}
         self.pos = [60, 60]
+        self.scale = 1.0
         self.load()
 
     def load(self):
@@ -139,6 +158,7 @@ class UsageStore:
                 data = json.load(f)
             self.days = data.get("days", {})
             self.pos = data.get("pos", self.pos)
+            self.scale = float(data.get("scale", 1.0))
         except Exception:
             pass
 
@@ -146,7 +166,7 @@ class UsageStore:
         try:
             os.makedirs(DATA_DIR, exist_ok=True)
             keep = sorted(self.days)[-400:]  # احتفظ بآخر ~13 شهر
-            payload = {"days": {k: self.days[k] for k in keep}, "pos": self.pos}
+            payload = {"days": {k: self.days[k] for k in keep}, "pos": self.pos, "scale": self.scale}
             tmp = DATA_FILE + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(payload, f)
@@ -166,6 +186,9 @@ class UsageStore:
 
 
 # ---------------------------------------------------------------- app
+SCALES = {"Small": 1.0, "Medium": 1.35, "Large": 1.8}
+
+
 class App:
     def __init__(self, start_hidden=False):
         self.store = UsageStore()
@@ -173,6 +196,8 @@ class App:
         self.on_top = True
         self.visible = not start_hidden
         self.ticks = 0
+        self.scale = self.store.scale if self.store.scale in SCALES.values() else 1.0
+        self.frame = None
 
         self.root = tk.Tk()
         self.root.title("Net Speed Monitor")
@@ -181,13 +206,27 @@ class App:
         self.root.attributes("-topmost", True)
         self.root.attributes("-alpha", 0.94)
 
-        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        x = min(max(int(self.store.pos[0]), 0), sw - 120)
-        y = min(max(int(self.store.pos[1]), 0), sh - 120)
+        vx, vy, vw, vh = virtual_screen(self.root)
+        x = min(max(int(self.store.pos[0]), vx), vx + vw - 80)
+        y = min(max(int(self.store.pos[1]), vy), vy + vh - 60)
         self.root.geometry(f"+{x}+{y}")
 
-        self.v = {k: tk.StringVar(value="-") for k in
-                  ("down", "up", "today", "today_s", "month", "month_s")}
+        self.v = {k: tk.StringVar(value="-") for k in ("down", "up", "totals")}
+
+        self.menu = tk.Menu(self.root, tearoff=0)
+        self.menu.add_command(label="Hide to tray", command=self.hide)
+        size_menu = tk.Menu(self.menu, tearoff=0)
+        self.size_var = tk.StringVar(value=self.size_name())
+        for name in SCALES:
+            size_menu.add_radiobutton(label=name, value=name, variable=self.size_var,
+                                      command=lambda n=name: self.set_scale(n))
+        self.menu.add_cascade(label="Size", menu=size_menu)
+        self.top_var = tk.BooleanVar(value=True)
+        self.menu.add_checkbutton(label="Always on top", variable=self.top_var,
+                                  command=self.toggle_top)
+        self.menu.add_separator()
+        self.menu.add_command(label="Exit", command=self.quit)
+
         self.build_ui()
 
         c = psutil.net_io_counters()
@@ -202,65 +241,72 @@ class App:
         self.root.after(1000, self.tick)
         self.root.after(150, self.poll)
 
-    # ---- UI
+    # ---- UI (لوحة صغيرة: سطر للتحميل، سطر للرفع، وسطر صغير للإجماليات)
+    def size_name(self):
+        for n, v in SCALES.items():
+            if abs(v - self.scale) < 0.01:
+                return n
+        return "Small"
+
     def build_ui(self):
-        f = tk.Frame(self.root, bg=BG, padx=14, pady=8,
+        if self.frame is not None:
+            self.frame.destroy()
+        s = self.scale
+        f_arrow = ("Segoe UI", int(round(10 * s)), "bold")
+        f_speed = ("Consolas", int(round(10 * s)), "bold")
+        f_small = ("Consolas", max(7, int(round(8 * s))))
+
+        f = tk.Frame(self.root, bg=BG, padx=int(8 * s), pady=int(3 * s),
                      highlightbackground=BORDER, highlightthickness=1)
         f.pack()
+        self.frame = f
 
-        tk.Label(f, text="Net Speed Monitor", bg=BG, fg=FG_MUTED,
-                 font=("Segoe UI", 8)).grid(row=0, column=0, sticky="w")
-        self.hide_btn = tk.Label(f, text="\u2013", bg=BG, fg=FG_MUTED,
-                                 font=("Segoe UI", 11, "bold"), cursor="hand2")
-        self.hide_btn.grid(row=0, column=1, sticky="e")
-        self.hide_btn.bind("<Button-1>", lambda e: self.hide())
+        for r, (arrow, key, color) in enumerate((("\u2193", "down", FG_DOWN),
+                                                 ("\u2191", "up", FG_UP))):
+            tk.Label(f, text=arrow, bg=BG, fg=color, font=f_arrow
+                     ).grid(row=r, column=0, sticky="w")
+            tk.Label(f, textvariable=self.v[key], bg=BG, fg=color, font=f_speed,
+                     anchor="e", width=12).grid(row=r, column=1, sticky="e")
 
-        self.row(f, 1, "\u2193 Download", "down", FG_DOWN, 14)
-        self.row(f, 2, "\u2191 Upload", "up", FG_UP, 14)
+        tk.Label(f, textvariable=self.v["totals"], bg=BG, fg=FG_MUTED, font=f_small
+                 ).grid(row=2, column=0, columnspan=2, sticky="ew")
 
-        tk.Frame(f, bg=BORDER, height=1).grid(row=3, column=0, columnspan=2, sticky="ew", pady=6)
+        self.bind_all(f)
+        self.bind_all(self.root)
 
-        self.row(f, 4, "Today", "today", FG_TOTAL, 12)
-        tk.Label(f, textvariable=self.v["today_s"], bg=BG, fg=FG_MUTED,
-                 font=("Consolas", 9), anchor="e").grid(row=5, column=0, columnspan=2, sticky="e")
-        self.row(f, 6, "This month", "month", FG_TOTAL, 12)
-        tk.Label(f, textvariable=self.v["month_s"], bg=BG, fg=FG_MUTED,
-                 font=("Consolas", 9), anchor="e").grid(row=7, column=0, columnspan=2, sticky="e")
+    def bind_all(self, w):
+        w.bind("<ButtonPress-1>", self.start_move)
+        w.bind("<B1-Motion>", self.do_move)
+        w.bind("<ButtonRelease-1>", self.end_move)
+        w.bind("<Button-3>", lambda e: self.menu.tk_popup(e.x_root, e.y_root))
+        for c in w.winfo_children():
+            self.bind_all(c)
 
-        self.menu = tk.Menu(self.root, tearoff=0)
-        self.menu.add_command(label="Hide to tray", command=self.hide)
-        self.menu.add_command(label="Exit", command=self.quit)
-
-        def bind_all(w):
-            if w is not self.hide_btn:
-                w.bind("<ButtonPress-1>", self.start_move)
-                w.bind("<B1-Motion>", self.do_move)
-                w.bind("<ButtonRelease-1>", self.end_move)
-            w.bind("<Button-3>", lambda e: self.menu.tk_popup(e.x_root, e.y_root))
-            for c in w.winfo_children():
-                bind_all(c)
-        bind_all(self.root)
-
-    def row(self, parent, r, label, key, color, size):
-        tk.Label(parent, text=label, bg=BG, fg=FG_LABEL, font=("Segoe UI", 10),
-                 anchor="w").grid(row=r, column=0, sticky="w", pady=1)
-        tk.Label(parent, textvariable=self.v[key], bg=BG, fg=color,
-                 font=("Consolas", size, "bold"), anchor="e", width=13
-                 ).grid(row=r, column=1, sticky="e", pady=1)
-
+    # ---- السحب: اسحب اللوحة من أي مكان فيها
     def start_move(self, e):
-        self._mx, self._my = e.x_root, e.y_root
+        self._ox = e.x_root - self.root.winfo_x()
+        self._oy = e.y_root - self.root.winfo_y()
 
     def do_move(self, e):
-        dx, dy = e.x_root - self._mx, e.y_root - self._my
-        self._mx, self._my = e.x_root, e.y_root
-        self.root.geometry(f"+{self.root.winfo_x() + dx}+{self.root.winfo_y() + dy}")
+        self.root.geometry(f"+{e.x_root - self._ox}+{e.y_root - self._oy}")
 
     def end_move(self, e):
         self.store.pos = [self.root.winfo_x(), self.root.winfo_y()]
         self.store.save()
 
-    # ---- show / hide
+    # ---- options
+    def set_scale(self, name):
+        self.scale = SCALES[name]
+        self.store.scale = self.scale
+        self.size_var.set(name)
+        self.build_ui()
+        self.store.save()
+
+    def toggle_top(self):
+        self.on_top = not self.on_top
+        self.top_var.set(self.on_top)
+        self.root.attributes("-topmost", self.on_top)
+
     def hide(self):
         self.root.withdraw()
         self.visible = False
@@ -285,8 +331,14 @@ class App:
 
     # ---- tray (callbacks تعمل في Thread آخر، فنمرر الأوامر عبر queue)
     def setup_tray(self):
+        def size_item(name):
+            return pystray.MenuItem(
+                name, lambda i, it, n=name: self.cmds.put("size:" + n),
+                checked=lambda it, n=name: self.size_name() == n, radio=True)
+
         menu = pystray.Menu(
             pystray.MenuItem("Show / Hide", lambda i, it: self.cmds.put("toggle"), default=True),
+            pystray.MenuItem("Size", pystray.Menu(*[size_item(n) for n in SCALES])),
             pystray.MenuItem("Always on top", lambda i, it: self.cmds.put("top"),
                              checked=lambda it: self.on_top),
             pystray.MenuItem("Start with Windows", lambda i, it: self.cmds.put("startup"),
@@ -304,10 +356,11 @@ class App:
                 if cmd == "toggle":
                     self.toggle()
                 elif cmd == "top":
-                    self.on_top = not self.on_top
-                    self.root.attributes("-topmost", self.on_top)
+                    self.toggle_top()
                 elif cmd == "startup":
                     set_startup(not startup_enabled())
+                elif cmd.startswith("size:"):
+                    self.set_scale(cmd.split(":", 1)[1])
                 elif cmd == "quit":
                     self.quit()
                     return
@@ -334,18 +387,17 @@ class App:
 
         down_kb = d_recv / 1024 / dt
         up_kb = d_sent / 1024 / dt
-        self.v["down"].set(f"{down_kb:,.1f} KB/s")
-        self.v["up"].set(f"{up_kb:,.1f} KB/s")
-
         td, tu = self.store.total(today)
         md, mu = self.store.total(today[:7])
-        self.v["today"].set(fmt_bytes(td + tu))
-        self.v["today_s"].set(f"\u2193 {fmt_bytes(td)}  \u2191 {fmt_bytes(tu)}")
-        self.v["month"].set(fmt_bytes(md + mu))
-        self.v["month_s"].set(f"\u2193 {fmt_bytes(md)}  \u2191 {fmt_bytes(mu)}")
+
+        self.v["down"].set(fmt_speed(down_kb))
+        self.v["up"].set(fmt_speed(up_kb))
+        self.v["totals"].set(f"Today {fmt_bytes(td + tu)}  |  Month {fmt_bytes(md + mu)}")
 
         try:
-            self.icon.title = f"\u2193 {down_kb:,.1f} KB/s   \u2191 {up_kb:,.1f} KB/s"
+            self.icon.title = (f"\u2193 {fmt_speed(down_kb)}   \u2191 {fmt_speed(up_kb)}\n"
+                               f"Today: {fmt_bytes(td)} \u2193  {fmt_bytes(tu)} \u2191\n"
+                               f"Month: {fmt_bytes(md)} \u2193  {fmt_bytes(mu)} \u2191")
         except Exception:
             pass
 
