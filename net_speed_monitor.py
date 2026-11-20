@@ -11,7 +11,10 @@ import datetime
 import json
 import os
 import queue
+import shutil
+import subprocess
 import sys
+import threading
 import time
 import tkinter as tk
 
@@ -88,6 +91,121 @@ def virtual_screen(root):
         return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
 
 
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+PS_GPU_SCRIPT = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+while ($true) {
+  $t = @{}
+  Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine | ForEach-Object {
+    $k = $_.Name -replace '^pid_\d+_','' -replace '_eng_\d+_','_'
+    $t[$k] = [double]$t[$k] + [double]$_.UtilizationPercentage
+  }
+  $m = ($t.Values | Measure-Object -Maximum).Maximum
+  if ($null -eq $m) { $o = -1 } else { $o = [int][math]::Min(100, [math]::Round($m)) }
+  try { [Console]::Out.WriteLine($o); [Console]::Out.Flush() } catch { exit }
+  Start-Sleep -Seconds 1
+}
+"""
+
+
+def level_color(pct):
+    if pct is None:
+        return FG_MUTED
+    if pct < 60:
+        return FG_DOWN
+    if pct < 85:
+        return FG_TOTAL
+    return "#f87171"
+
+
+def find_nvidia_smi():
+    p = shutil.which("nvidia-smi")
+    if p:
+        return p
+    for c in (r"C:\Windows\System32\nvidia-smi.exe",
+              r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"):
+        if os.path.exists(c):
+            return c
+    return None
+
+
+class GPUMonitor:
+    """يقرأ استخدام كارت الشاشة في Thread منفصل (NVIDIA عبر nvidia-smi، وغيره عبر عدّادات ويندوز)."""
+
+    def __init__(self):
+        self.value = None  # 0..100 أو None إذا غير متاح
+        self._stop = threading.Event()
+        self._thread = None
+        self._proc = None
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        p = self._proc
+        if p:
+            try:
+                p.kill()
+            except Exception:
+                pass
+        self.value = None
+
+    def _run(self):
+        try:
+            smi = find_nvidia_smi()
+            if smi and self._run_nvidia(smi):
+                return
+            self._run_wmi()
+        except Exception:
+            self.value = None
+
+    def _run_nvidia(self, smi):
+        fails = 0
+        while not self._stop.is_set():
+            try:
+                out = subprocess.run(
+                    [smi, "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+                    stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                    timeout=5, creationflags=NO_WINDOW)
+                vals = [int(x) for x in out.stdout.split() if x.strip().isdigit()]
+                if out.returncode != 0 or not vals:
+                    raise ValueError("no data")
+                self.value = max(vals)
+                fails = 0
+            except Exception:
+                fails += 1
+                if fails >= 3:
+                    return False
+            self._stop.wait(2)
+        return True
+
+    def _run_wmi(self):
+        ps = shutil.which("powershell") or "powershell"
+        self._proc = subprocess.Popen(
+            [ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+             "-Command", PS_GPU_SCRIPT],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, creationflags=NO_WINDOW)
+        for line in self._proc.stdout:
+            if self._stop.is_set():
+                break
+            try:
+                v = int(line.strip())
+            except ValueError:
+                continue
+            self.value = None if v < 0 else max(0, min(100, v))
+        try:
+            self._proc.kill()
+        except Exception:
+            pass
+
+
 def startup_command():
     if getattr(sys, "frozen", False):
         return f'"{sys.executable}" --minimized'
@@ -150,6 +268,7 @@ class UsageStore:
         self.days = {}
         self.pos = [60, 60]
         self.scale = 1.0
+        self.show_sys = True
         self.load()
 
     def load(self):
@@ -159,6 +278,7 @@ class UsageStore:
             self.days = data.get("days", {})
             self.pos = data.get("pos", self.pos)
             self.scale = float(data.get("scale", 1.0))
+            self.show_sys = bool(data.get("sys", True))
         except Exception:
             pass
 
@@ -166,7 +286,7 @@ class UsageStore:
         try:
             os.makedirs(DATA_DIR, exist_ok=True)
             keep = sorted(self.days)[-400:]  # احتفظ بآخر ~13 شهر
-            payload = {"days": {k: self.days[k] for k in keep}, "pos": self.pos, "scale": self.scale}
+            payload = {"days": {k: self.days[k] for k in keep}, "pos": self.pos, "scale": self.scale, "sys": self.show_sys}
             tmp = DATA_FILE + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(payload, f)
@@ -198,6 +318,10 @@ class App:
         self.ticks = 0
         self.scale = self.store.scale if self.store.scale in SCALES.values() else 1.0
         self.frame = None
+        self.sys_labels = {}
+        self.show_sys = self.store.show_sys
+        self.gpu = GPUMonitor()
+        psutil.cpu_percent(None)  # قراءة أولية (الأولى دائمًا 0)
 
         self.root = tk.Tk()
         self.root.title("Net Speed Monitor")
@@ -221,6 +345,9 @@ class App:
             size_menu.add_radiobutton(label=name, value=name, variable=self.size_var,
                                       command=lambda n=name: self.set_scale(n))
         self.menu.add_cascade(label="Size", menu=size_menu)
+        self.sys_var = tk.BooleanVar(value=self.show_sys)
+        self.menu.add_checkbutton(label="Show CPU / RAM / GPU", variable=self.sys_var,
+                                  command=self.toggle_sys)
         self.top_var = tk.BooleanVar(value=True)
         self.menu.add_checkbutton(label="Always on top", variable=self.top_var,
                                   command=self.toggle_top)
@@ -228,6 +355,8 @@ class App:
         self.menu.add_command(label="Exit", command=self.quit)
 
         self.build_ui()
+        if self.show_sys:
+            self.gpu.start()
 
         c = psutil.net_io_counters()
         self.last_recv, self.last_sent, self.last_time = c.bytes_recv, c.bytes_sent, time.time()
@@ -271,6 +400,16 @@ class App:
         tk.Label(f, textvariable=self.v["totals"], bg=BG, fg=FG_MUTED, font=f_small
                  ).grid(row=2, column=0, columnspan=2, sticky="ew")
 
+        self.sys_labels = {}
+        if self.show_sys:
+            row = tk.Frame(f, bg=BG)
+            row.grid(row=3, column=0, columnspan=2, pady=(int(2 * s), 0))
+            for key in ("CPU", "RAM", "GPU"):
+                lb = tk.Label(row, text=f"{key} --", bg=BG, fg=FG_MUTED, font=f_small,
+                              width=8, anchor="center")
+                lb.pack(side="left", padx=int(2 * s))
+                self.sys_labels[key] = lb
+
         self.bind_all(f)
         self.bind_all(self.root)
 
@@ -307,6 +446,17 @@ class App:
         self.top_var.set(self.on_top)
         self.root.attributes("-topmost", self.on_top)
 
+    def toggle_sys(self):
+        self.show_sys = not self.show_sys
+        self.store.show_sys = self.show_sys
+        self.sys_var.set(self.show_sys)
+        if self.show_sys:
+            self.gpu.start()
+        else:
+            self.gpu.stop()
+        self.build_ui()
+        self.store.save()
+
     def hide(self):
         self.root.withdraw()
         self.visible = False
@@ -322,6 +472,7 @@ class App:
     def quit(self):
         self.store.pos = [self.root.winfo_x(), self.root.winfo_y()]
         self.store.save()
+        self.gpu.stop()
         try:
             if self.icon:
                 self.icon.stop()
@@ -344,6 +495,8 @@ class App:
         menu = pystray.Menu(
             pystray.MenuItem("Show / Hide", lambda i, it: self.cmds.put("toggle"), default=True),
             pystray.MenuItem("Size", pystray.Menu(*[size_item(n) for n in SCALES])),
+            pystray.MenuItem("Show CPU / RAM / GPU", lambda i, it: self.cmds.put("sys"),
+                             checked=lambda it: self.show_sys),
             pystray.MenuItem("Always on top", lambda i, it: self.cmds.put("top"),
                              checked=lambda it: self.on_top),
             pystray.MenuItem("Start with Windows", lambda i, it: self.cmds.put("startup"),
@@ -362,6 +515,8 @@ class App:
                     self.toggle()
                 elif cmd == "top":
                     self.toggle_top()
+                elif cmd == "sys":
+                    self.toggle_sys()
                 elif cmd == "startup":
                     set_startup(not startup_enabled())
                 elif cmd.startswith("size:"):
@@ -399,10 +554,22 @@ class App:
         self.v["up"].set(fmt_speed(up_kb))
         self.v["totals"].set(f"Today {fmt_bytes(td + tu)}  |  Month {fmt_bytes(md + mu)}")
 
+        cpu = psutil.cpu_percent(None)
+        vm = psutil.virtual_memory()
+        gpu = self.gpu.value if self.show_sys else None
+        for key, val in (("CPU", cpu), ("RAM", vm.percent), ("GPU", gpu)):
+            lb = self.sys_labels.get(key)
+            if lb is not None:
+                lb.config(text=f"{key} {val:.0f}%" if val is not None else f"{key} --",
+                          fg=level_color(val))
+
         try:
-            self.icon.title = (f"\u2193 {fmt_speed(down_kb)}   \u2191 {fmt_speed(up_kb)}\n"
-                               f"Today: {fmt_bytes(td)} \u2193  {fmt_bytes(tu)} \u2191\n"
-                               f"Month: {fmt_bytes(md)} \u2193  {fmt_bytes(mu)} \u2191")
+            tip = (f"\u2193 {fmt_speed(down_kb)}   \u2191 {fmt_speed(up_kb)}\n"
+                   f"Today {fmt_bytes(td + tu)} | Month {fmt_bytes(md + mu)}")
+            if self.show_sys:
+                tip += (f"\nCPU {cpu:.0f}%  RAM {vm.percent:.0f}%  GPU "
+                        + (f"{gpu:.0f}%" if gpu is not None else "--"))
+            self.icon.title = tip[:127]
         except Exception:
             pass
 
